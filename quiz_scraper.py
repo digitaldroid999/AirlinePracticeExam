@@ -615,6 +615,58 @@ def list_module_checkbox_ids(soup: BeautifulSoup) -> list[str]:
     return names
 
 
+def module_label_from_params(soup: BeautifulSoup, mod_id: str) -> str:
+    """Human label from tblModuleDisplay (e.g. mod000 -> '000, Aircraft General')."""
+    mid = mod_id.strip()
+    lab = soup.find("label", attrs={"for": mid}) or soup.find("label", attrs={"for": mid.lower()})
+    if lab is not None:
+        t = lab.get_text(" ", strip=True)
+        if t:
+            return t
+    return mid
+
+
+def quiz_banner_title(rows: list[dict[str, Any]]) -> str:
+    """Strip '(Question N of M)' for logs — show system quiz title only."""
+    for row in rows:
+        t = row.get("title")
+        if isinstance(t, str) and t.strip():
+            return re.sub(r"\s*\(Question\s+.*$", "", t, flags=re.I).strip() or t.strip()
+    return "Systems quiz"
+
+
+def pair_already_stored(conn: sqlite3.Connection, question_text: str, correct_text: str) -> bool:
+    """
+    Skip if this question is already in question_bank (unique per question_text),
+    or the same (question_text, correct_text) exists in quiz_items only.
+    """
+    if conn.execute(
+        "SELECT 1 FROM question_bank WHERE question_text = ?",
+        (question_text,),
+    ).fetchone():
+        return True
+    if conn.execute(
+        "SELECT 1 FROM quiz_items WHERE question_text = ? AND correct_text = ?",
+        (question_text, correct_text),
+    ).fetchone():
+        return True
+    return False
+
+
+def filter_rows_not_yet_stored(
+    conn: sqlite3.Connection, rows: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop rows whose (question_text, correct_text) pair is already in the DB."""
+    fresh: list[dict[str, Any]] = []
+    skipped = 0
+    for row in rows:
+        if pair_already_stored(conn, row["question"], row["correct_text"]):
+            skipped += 1
+            continue
+        fresh.append(row)
+    return fresh, skipped
+
+
 def params_soup_after_fleet(session: requests.Session, fleet_key: str) -> BeautifulSoup:
     """aapParams.aspx after fleet postback (module table visible)."""
     soup = start_params_session(session)
@@ -803,25 +855,20 @@ def insert_run(
 
 def record_unique_questions(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> tuple[int, int]:
     """
-    Store each question + correct answer in question_bank only if question_text
-    is not already present (no duplicate rows for repeated questions across runs).
+    Insert new rows into question_bank only. No UPDATE on duplicates.
+    Caller should pass rows not already in question_bank (typically after filter_rows_not_yet_stored).
     """
     now = datetime.now(timezone.utc).isoformat()
     inserted = 0
     skipped = 0
     for row in rows:
         qtext = row["question"]
-        cur = conn.execute("SELECT 1 FROM question_bank WHERE question_text = ?", (qtext,))
-        if cur.fetchone() is not None:
+        ct = row["correct_text"]
+        if conn.execute(
+            "SELECT 1 FROM question_bank WHERE question_text = ?",
+            (qtext,),
+        ).fetchone():
             skipped += 1
-            conn.execute(
-                """
-                UPDATE question_bank
-                SET last_seen_at = ?, seen_count = seen_count + 1
-                WHERE question_text = ?
-                """,
-                (now, qtext),
-            )
             continue
         conn.execute(
             """
@@ -834,7 +881,7 @@ def record_unique_questions(conn: sqlite3.Connection, rows: list[dict[str, Any]]
                 qtext,
                 json.dumps(row["options"], ensure_ascii=False),
                 row["correct_index"],
-                row["correct_text"],
+                ct,
                 row.get("corr_ans_code"),
                 now,
                 now,
@@ -956,7 +1003,8 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
                 for mod in mod_list:
-                    print(f"  module {mod} ...", flush=True)
+                    label = module_label_from_params(soup_params, mod)
+                    print(f"  {label} ...", flush=True)
                     rows = scrape_one_run(
                         session,
                         fleet_key=args.fleet,
@@ -967,20 +1015,29 @@ def main(argv: list[str] | None = None) -> int:
                         delay_s=args.delay,
                         certain_module_ids=[mod],
                     )
+                    new_rows, n_skip_pre = filter_rows_not_yet_stored(conn, rows)
+                    title = quiz_banner_title(rows)
+                    if not new_rows:
+                        print(
+                            f"    {title} — skip DB: all {len(rows)} question/answer pair(s) already stored",
+                            flush=True,
+                        )
+                        continue
                     run_id = insert_run(
                         conn,
                         fleet_key=args.fleet,
                         fleet_value=FLEETS[args.fleet],
                         question_limit=args.limit,
                         module_options=module_options,
-                        num_questions=len(rows),
+                        num_questions=len(new_rows),
                         module_scope=mod,
                     )
-                    insert_items(conn, run_id, rows)
-                    new_bank, skip_bank = record_unique_questions(conn, rows)
+                    new_bank, _ = record_unique_questions(conn, new_rows)
+                    insert_items(conn, run_id, new_rows)
                     print(
-                        f"    run_id={run_id} quiz_items={len(rows)}; "
-                        f"question_bank +{new_bank} new, {skip_bank} already in DB",
+                        f"    {title} — saved {len(new_rows)} quiz row(s); "
+                        f"question_bank +{new_bank} new; "
+                        f"skipped {n_skip_pre} pair(s) already in DB before insert",
                         flush=True,
                     )
                 continue
@@ -998,21 +1055,29 @@ def main(argv: list[str] | None = None) -> int:
                 submitted_radio_value=args.pick,
                 delay_s=args.delay,
             )
-
+            new_rows, n_skip_pre = filter_rows_not_yet_stored(conn, rows)
+            title = quiz_banner_title(rows)
+            if not new_rows:
+                print(
+                    f"  {title} — skip DB: all {len(rows)} question/answer pair(s) already stored",
+                    flush=True,
+                )
+                continue
             run_id = insert_run(
                 conn,
                 fleet_key=args.fleet,
                 fleet_value=FLEETS[args.fleet],
                 question_limit=args.limit,
                 module_options=module_options,
-                num_questions=len(rows),
+                num_questions=len(new_rows),
                 module_scope=None,
             )
-            insert_items(conn, run_id, rows)
-            new_bank, skip_bank = record_unique_questions(conn, rows)
+            new_bank, _ = record_unique_questions(conn, new_rows)
+            insert_items(conn, run_id, new_rows)
             print(
-                f"  stored run_id={run_id} quiz_items={len(rows)}; "
-                f"question_bank +{new_bank} new, {skip_bank} already in DB",
+                f"  {title} — saved {len(new_rows)} quiz row(s); "
+                f"question_bank +{new_bank} new; "
+                f"skipped {n_skip_pre} pair(s) already in DB before insert",
                 flush=True,
             )
     finally:
