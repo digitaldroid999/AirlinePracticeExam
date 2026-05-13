@@ -11,15 +11,18 @@ your logged-in browser via --cookies (Netscape format).
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from http.cookiejar import MozillaCookieJar
+from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -635,36 +638,69 @@ def quiz_banner_title(rows: list[dict[str, Any]]) -> str:
     return "Systems quiz"
 
 
-def pair_already_stored(conn: sqlite3.Connection, question_text: str, correct_text: str) -> bool:
-    """
-    Skip if this question is already in question_bank (unique per question_text),
-    or the same (question_text, correct_text) exists in quiz_items only.
-    """
-    if conn.execute(
-        "SELECT 1 FROM question_bank WHERE question_text = ?",
-        (question_text,),
-    ).fetchone():
-        return True
-    if conn.execute(
-        "SELECT 1 FROM quiz_items WHERE question_text = ? AND correct_text = ?",
-        (question_text, correct_text),
-    ).fetchone():
-        return True
-    return False
+def find_getgraphic_src(soup: BeautifulSoup) -> str | None:
+    """Return img src for question graphics (getGraphic.ashx...), if present."""
+    img = soup.find(id="imgState")
+    if img is None:
+        img = soup.find("img", src=re.compile(r"getGraphic\.ashx", re.I))
+    if img is None:
+        return None
+    src = html.unescape((img.get("src") or "").strip())
+    return src or None
 
 
-def filter_rows_not_yet_stored(
-    conn: sqlite3.Connection, rows: list[dict[str, Any]]
-) -> tuple[list[dict[str, Any]], int]:
-    """Drop rows whose (question_text, correct_text) pair is already in the DB."""
-    fresh: list[dict[str, Any]] = []
-    skipped = 0
-    for row in rows:
-        if pair_already_stored(conn, row["question"], row["correct_text"]):
-            skipped += 1
-            continue
-        fresh.append(row)
-    return fresh, skipped
+def _ext_from_image_bytes(data: bytes, content_type: str | None) -> str:
+    ct = (content_type or "").lower()
+    if "png" in ct:
+        return ".png"
+    if "jpeg" in ct or "jpg" in ct:
+        return ".jpg"
+    if "gif" in ct:
+        return ".gif"
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if len(data) >= 6 and data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    return ".bin"
+
+
+def _filename_for_graphic_src(src: str) -> str:
+    full = urljoin(BASE, src)
+    parsed = urlparse(full)
+    pairs = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    parts: list[str] = []
+    for key in ("FleetID", "ModNum", "ScenNum", "Qnum"):
+        if key in pairs:
+            parts.append(f"{key}{pairs[key]}")
+    if parts:
+        stem = "_".join(parts)
+    else:
+        stem = sha256((parsed.path + "?" + parsed.query).encode()).hexdigest()[:24]
+    return re.sub(r"[^\w\-.]", "_", stem)[:140]
+
+
+def save_question_graphic(session: requests.Session, soup: BeautifulSoup, media_root: Path) -> str | None:
+    """
+    Download getGraphic.ashx image into media_root; return DB path like 'quiz_media/FleetID7_....png'.
+    """
+    src = find_getgraphic_src(soup)
+    if not src:
+        return None
+    url = urljoin(BASE, src)
+    try:
+        r = session.get(url, timeout=90)
+        r.raise_for_status()
+    except requests.RequestException:
+        return None
+    ext = _ext_from_image_bytes(r.content, r.headers.get("Content-Type"))
+    fname = _filename_for_graphic_src(src) + ext
+    media_root.mkdir(parents=True, exist_ok=True)
+    out_path = media_root / fname
+    if not out_path.exists() or out_path.stat().st_size != len(r.content):
+        out_path.write_bytes(r.content)
+    return f"{media_root.name}/{fname}".replace("\\", "/")
 
 
 def params_soup_after_fleet(session: requests.Session, fleet_key: str) -> BeautifulSoup:
@@ -683,6 +719,7 @@ def scrape_one_run(
     submitted_radio_value: str,
     delay_s: float,
     certain_module_ids: list[str] | None = None,
+    media_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     fleet_value = FLEETS[fleet_key]
     soup = start_params_session(session)
@@ -729,6 +766,8 @@ def scrape_one_run(
         if not question or not options:
             raise RuntimeError("Missing question or options on Submit Answer page")
 
+        img_rel = save_question_graphic(session, soup, media_root) if media_root else None
+
         form = soup.find("form", id="form1")
         if form is None:
             raise RuntimeError("Submit Answer: form1 missing")
@@ -751,6 +790,7 @@ def scrape_one_run(
             radio_name=radio_name,
             response_url=ctx.last_response_url or ctx.quiz_url,
         )
+        row["image_relpath"] = img_rel
         rows.append(row)
 
         btn2 = find_toolbar_submit(soup)
@@ -800,6 +840,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             corr_ans_code TEXT,
             submitted_choice TEXT,
             graded_result TEXT,
+            image_relpath TEXT,
             UNIQUE(run_id, seq),
             FOREIGN KEY (run_id) REFERENCES scrape_runs(id)
         );
@@ -811,6 +852,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             correct_index INTEGER NOT NULL,
             correct_text TEXT NOT NULL,
             corr_ans_code TEXT,
+            image_relpath TEXT,
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL,
             seen_count INTEGER NOT NULL DEFAULT 1
@@ -821,6 +863,10 @@ def init_db(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(scrape_runs)").fetchall()}
     if cols and "module_scope" not in cols:
         conn.execute("ALTER TABLE scrape_runs ADD COLUMN module_scope TEXT")
+    for tbl in ("quiz_items", "question_bank"):
+        tcols = {row[1] for row in conn.execute(f"PRAGMA table_info({tbl})").fetchall()}
+        if tcols and "image_relpath" not in tcols:
+            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN image_relpath TEXT")
     conn.commit()
 
 
@@ -853,43 +899,68 @@ def insert_run(
     return int(cur.lastrowid)
 
 
-def record_unique_questions(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> tuple[int, int]:
+def upsert_question_bank(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> tuple[int, int]:
     """
-    Insert new rows into question_bank only. No UPDATE on duplicates.
-    Caller should pass rows not already in question_bank (typically after filter_rows_not_yet_stored).
+    One row per question_text. Insert new questions; on duplicate, refresh options/answers/image
+    and bump seen_count / last_seen_at.
     """
     now = datetime.now(timezone.utc).isoformat()
     inserted = 0
-    skipped = 0
+    updated = 0
     for row in rows:
         qtext = row["question"]
+        opts_json = json.dumps(row["options"], ensure_ascii=False)
         ct = row["correct_text"]
+        img = row.get("image_relpath")
         if conn.execute(
             "SELECT 1 FROM question_bank WHERE question_text = ?",
             (qtext,),
         ).fetchone():
-            skipped += 1
-            continue
-        conn.execute(
-            """
-            INSERT INTO question_bank (
-                question_text, options_json, correct_index, correct_text, corr_ans_code,
-                first_seen_at, last_seen_at, seen_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-            """,
-            (
-                qtext,
-                json.dumps(row["options"], ensure_ascii=False),
-                row["correct_index"],
-                ct,
-                row.get("corr_ans_code"),
-                now,
-                now,
-            ),
-        )
-        inserted += 1
+            conn.execute(
+                """
+                UPDATE question_bank SET
+                    options_json = ?,
+                    correct_index = ?,
+                    correct_text = ?,
+                    corr_ans_code = ?,
+                    image_relpath = COALESCE(?, image_relpath),
+                    last_seen_at = ?,
+                    seen_count = seen_count + 1
+                WHERE question_text = ?
+                """,
+                (
+                    opts_json,
+                    row["correct_index"],
+                    ct,
+                    row.get("corr_ans_code"),
+                    img,
+                    now,
+                    qtext,
+                ),
+            )
+            updated += 1
+        else:
+            conn.execute(
+                """
+                INSERT INTO question_bank (
+                    question_text, options_json, correct_index, correct_text, corr_ans_code,
+                    image_relpath, first_seen_at, last_seen_at, seen_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    qtext,
+                    opts_json,
+                    row["correct_index"],
+                    ct,
+                    row.get("corr_ans_code"),
+                    img,
+                    now,
+                    now,
+                ),
+            )
+            inserted += 1
     conn.commit()
-    return inserted, skipped
+    return inserted, updated
 
 
 def insert_items(conn: sqlite3.Connection, run_id: int, rows: list[dict[str, Any]]) -> None:
@@ -898,8 +969,9 @@ def insert_items(conn: sqlite3.Connection, run_id: int, rows: list[dict[str, Any
             """
             INSERT INTO quiz_items (
                 run_id, seq, title, question_num, question_total, question_text, options_json,
-                correct_index, correct_text, corr_ans_code, submitted_choice, graded_result
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                correct_index, correct_text, corr_ans_code, submitted_choice, graded_result,
+                image_relpath
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -914,6 +986,7 @@ def insert_items(conn: sqlite3.Connection, run_id: int, rows: list[dict[str, Any
                 row.get("corr_ans_code"),
                 row.get("submitted_choice"),
                 row.get("graded_result"),
+                row.get("image_relpath"),
             ),
         )
     conn.commit()
@@ -962,6 +1035,16 @@ def main(argv: list[str] | None = None) -> int:
         default="radDist1",
         help='Radio "value" to submit each time (default radDist1); any choice works because CorrAns reveals the key',
     )
+    p.add_argument(
+        "--media-dir",
+        default="quiz_media",
+        help="Folder for question images (getGraphic.ashx). Relative paths are resolved from cwd. Ignored with --no-graphics.",
+    )
+    p.add_argument(
+        "--no-graphics",
+        action="store_true",
+        help="Do not download question images.",
+    )
     args = p.parse_args(argv)
 
     module_map = {
@@ -973,6 +1056,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.module_mode == "certain" and not args.each_module and not args.modules:
         p.error("--module-mode certain requires --each-module or --modules mod000,mod210,...")
+
+    media_root: Path | None = None
+    if not args.no_graphics:
+        media_root = Path(args.media_dir).expanduser().resolve()
 
     session = requests.Session()
     session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
@@ -1014,14 +1101,11 @@ def main(argv: list[str] | None = None) -> int:
                         submitted_radio_value=args.pick,
                         delay_s=args.delay,
                         certain_module_ids=[mod],
+                        media_root=media_root,
                     )
-                    new_rows, n_skip_pre = filter_rows_not_yet_stored(conn, rows)
                     title = quiz_banner_title(rows)
-                    if not new_rows:
-                        print(
-                            f"    {title} — skip DB: all {len(rows)} question/answer pair(s) already stored",
-                            flush=True,
-                        )
+                    if not rows:
+                        print(f"    {title} — no questions scraped", flush=True)
                         continue
                     run_id = insert_run(
                         conn,
@@ -1029,15 +1113,14 @@ def main(argv: list[str] | None = None) -> int:
                         fleet_value=FLEETS[args.fleet],
                         question_limit=args.limit,
                         module_options=module_options,
-                        num_questions=len(new_rows),
+                        num_questions=len(rows),
                         module_scope=mod,
                     )
-                    new_bank, _ = record_unique_questions(conn, new_rows)
-                    insert_items(conn, run_id, new_rows)
+                    n_ins, n_upd = upsert_question_bank(conn, rows)
+                    insert_items(conn, run_id, rows)
                     print(
-                        f"    {title} — saved {len(new_rows)} quiz row(s); "
-                        f"question_bank +{new_bank} new; "
-                        f"skipped {n_skip_pre} pair(s) already in DB before insert",
+                        f"    {title} — scraped {len(rows)}; wrote {len(rows)} quiz_items; "
+                        f"question_bank +{n_ins} new, {n_upd} updated",
                         flush=True,
                     )
                 continue
@@ -1054,14 +1137,11 @@ def main(argv: list[str] | None = None) -> int:
                 module_mode=args.module_mode,
                 submitted_radio_value=args.pick,
                 delay_s=args.delay,
+                media_root=media_root,
             )
-            new_rows, n_skip_pre = filter_rows_not_yet_stored(conn, rows)
             title = quiz_banner_title(rows)
-            if not new_rows:
-                print(
-                    f"  {title} — skip DB: all {len(rows)} question/answer pair(s) already stored",
-                    flush=True,
-                )
+            if not rows:
+                print(f"  {title} — no questions scraped", flush=True)
                 continue
             run_id = insert_run(
                 conn,
@@ -1069,15 +1149,14 @@ def main(argv: list[str] | None = None) -> int:
                 fleet_value=FLEETS[args.fleet],
                 question_limit=args.limit,
                 module_options=module_options,
-                num_questions=len(new_rows),
+                num_questions=len(rows),
                 module_scope=None,
             )
-            new_bank, _ = record_unique_questions(conn, new_rows)
-            insert_items(conn, run_id, new_rows)
+            n_ins, n_upd = upsert_question_bank(conn, rows)
+            insert_items(conn, run_id, rows)
             print(
-                f"  {title} — saved {len(new_rows)} quiz row(s); "
-                f"question_bank +{new_bank} new; "
-                f"skipped {n_skip_pre} pair(s) already in DB before insert",
+                f"  {title} — scraped {len(rows)}; wrote {len(rows)} quiz_items; "
+                f"question_bank +{n_ins} new, {n_upd} updated",
                 flush=True,
             )
     finally:
